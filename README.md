@@ -6,7 +6,7 @@ a small exe modification to solve the commonly named "xml shadow", via incorrect
 - creates backup of original executable  
 
 ## usage
-1. either download the standalone patcher executable, or the script and accompanying files (ensure you have a sufficient python installation)  
+1. either download the standalone patcher executable, or the script and accompanying bin file (ensure you have a sufficient python installation)  
 2. ensure stormworks is closed, this patcher must modify the games executable itself  
 3. run the patcher, the file explorer will be prompted for you to select the stormworks64.exe executable (select the 64 bit version!)  
 4. apply the patch  
