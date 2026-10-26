@@ -23,7 +23,8 @@ a small client side exe modification to solve the commonly named "xml shadow", v
 being something that modifies the executable itself: any time the game updates and modifies the executable, you will have to apply the patch again  
 along with that, new game versions may affect the underlying mesh update systems that this serves to fix, if you are applying this tool on a newer game version, there is a chance it may fail!  
 in that case, either reinstate the exe backup it creates in the same folder as the stormworks executable, or verify your game files on steam to return to the original configuration  
-yes, windows will flag the application as an unknown publisher, i am a very not known publisher
+yes, windows will flag the application as an unknown publisher, i am a very not known publisher  
+all made with my own bad coding practices  
 
 ## building it
 the bat file runs the gnu assembler on the `fixed_normal_calculation.asm` file and outputs the corresponding bin file  
