@@ -1,5 +1,5 @@
 # stormworks-normal-patch
-a small client side exe modification to solve the commonly named "xml shadow", via incorrectly transformed normal vectors from non-orthonormal transformation matrices
+a small client side exe modification to solve the commonly named "xml shadow", via correcting incorrectly transformed normal vectors from non-orthonormal transformation matrices
 
 - automatic executable patcher
 - self contained windows build
