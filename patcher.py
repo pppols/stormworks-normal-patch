@@ -20,21 +20,21 @@ def write_u32(data, offset, value):
 def allign(value, allignment):
     return (value + allignment - 1) // allignment * allignment
 
-def relative_jump(source_rva, destination_rva):
-    displacement = destination_rva - source_rva - 5
-    return b"\xE9" + struct.pack("<i", displacement)
-
-def rva_to_offset(rva, section_headers):
+def offset_to_rva(offset, section_headers):
 
     for header in section_headers:
 
-        start = header["rva"]
-        size = header["raw_size"]
+        section_start = header["raw_offset"]
+        section_end = section_start + header["raw_size"]
 
-        if start <= rva < start + size:
-            return header["raw_offset"] + (rva - start)
+        if section_start <= offset < section_end:
+            return header["rva"] + (offset - section_start)
 
-    raise ValueError("could not find rva offset")
+    raise ValueError("could not find rva from offset")
+
+def relative_jump(source_rva, destination_rva):
+    displacement = destination_rva - source_rva - 5
+    return b"\xE9" + struct.pack("<i", displacement)
 
 def get_checksum(data, optional_offset):
 
@@ -62,41 +62,62 @@ def get_checksum(data, optional_offset):
 
     return checksum
 
+def save_to_file(data, path):
+    path.write_bytes(data)
+
+def scan_for_signiature(data, signiature, search_start=0, search_length=None):
+
+    offset = search_start
+    search_end = (len(data)  if search_length is None  else search_start + search_length)
+    match_length = len(signiature)
+    matches = []
+    
+    while True:
+        
+        index = data.find(signiature, offset, search_end)
+
+        if index == -1:
+            break
+
+        matches.append(index)
+        offset = index + match_length
+
+    return matches
+
+
 def load_payload(payload_path):
 
-    payload = bytearray(Path(payload_path).read_bytes())
+    payload = bytearray(payload_path.read_bytes())
 
 
-    # find and verify return placeholder
-    offset = payload.find(RETURN_PLACEHOLDER_SIGNIATURE)
+    # confirm hash
+    hash = hashlib.sha256(payload).hexdigest()
 
-    if offset == -1:
-        raise ValueError("return placeholder not found")
+    if hash != EXPECTED_PAYLOAD_HASH:
 
-    padding = payload[offset + 5:]
+        messagebox.showerror(
+            "Error!",
+            "The patch payload is malformed or corrupted!\nThis likely indicates that a mistake has been made in distributing or downloading the build\nPlease check for updates to this patcher!"
+        )
 
-    if any(byte != 0x90 for byte in padding):
-        raise ValueError("unexpected bytes after return placeholder")
-
-    del payload[offset + 5:]
+        raise SystemExit
 
 
-    return (payload, offset)
+    return payload
 
 def load_exe(exe_path):
 
-    path = Path(exe_path)
-    data = bytearray(path.read_bytes())
+    data = bytearray(exe_path.read_bytes())
 
 
     # confirm hash
     hash = hashlib.sha256(data).hexdigest()
 
-    if hash != EXPECTED_HASH:
+    if hash != EXPECTED_EXE_HASH:
 
         confirmed = messagebox.askokcancel(
             "Warning!",
-            "This executable is malformed, or has been modified from the expected version!\nThis may indicate that the executable has already been patched, or that the game has since been updated\nGame updates may result in a corrupt patch!\nContinue anyways?",
+            "This executable is malformed, or has been modified from the expected version!\nThis may indicate that the game has since been updated\nGame updates may result in a failed patch!\nContinue anyways?",
             icon="warning"
         )
 
@@ -179,7 +200,6 @@ def get_patch_section_details(data, optional_offset, section_offset, section_cou
 
     size_of_headers = read_u32(data, optional_offset + 60)
 
-
     if patch_header_offset + 40 > first_raw_offset:
         raise ValueError("not enough space before section data, i hope this fucking never happens for all future time in the universe to come ever")
 
@@ -187,7 +207,7 @@ def get_patch_section_details(data, optional_offset, section_offset, section_cou
         raise ValueError("not enough pe header space")
 
     if data[patch_header_offset:patch_header_offset+40] != bytes(40):
-        raise ValueError("new section region not empty")
+        raise ValueError("new header region not empty")
 
 
     # get patch section
@@ -205,16 +225,16 @@ def get_patch_section_details(data, optional_offset, section_offset, section_cou
     
     return (patch_header_offset, patch_rva, patch_raw_offset)
 
-def insert_patch_section_header(data, header_offset, section_rva, raw_offset, size, file_allignment):
+def insert_patch_section_header(data, header_offset, section_rva, section_raw_offset, section_size, file_allignment):
 
-    raw_size = allign(size, file_allignment)
+    section_raw_size = allign(section_size, file_allignment)
 
     struct.pack_into("<8sIIIIIIHHI", data, header_offset,
         b".patch",
-        size,
+        section_size,
         section_rva,
-        raw_size,
-        raw_offset,
+        section_raw_size,
+        section_raw_offset,
         0,
         0,
         0,
@@ -227,7 +247,7 @@ def insert_patch_section(data, payload, raw_offset, file_allignment):
     raw_size = allign(len(payload), file_allignment)
 
     if len(data) > raw_offset:
-        raise ValueError("patch section overlaps existing data")
+        raise ValueError("patch section overlaps existing exe data")
 
     # extend and patch file
     data.extend(b"\x00" * (raw_offset - len(data)))
@@ -236,22 +256,17 @@ def insert_patch_section(data, payload, raw_offset, file_allignment):
 
     data.extend(b"\x00" * (raw_size - len(payload)))
 
-def get_trampoline_details(data, payload, section_headers, patch_rva, return_offset):
+def get_trampoline_instructions(section_headers, hook_entry_offset, hook_return_offset, payload_return_offset, patch_rva):
 
     # entry jump
-    hook_offset = rva_to_offset(HOOK_RVA, section_headers)
-        
-    if data[hook_offset:hook_offset + 5] != EXPECTED_HOOK_SIGNIATURE:
-        raise ValueError("Hook signiature does not match, the patch has either already been applied, or must be updated!")
-        
-    hook_jump = relative_jump(HOOK_RVA, patch_rva)
-
+    hook_entry_rva = offset_to_rva(hook_entry_offset, section_headers)
+    hook_jump = relative_jump(hook_entry_rva, patch_rva)
 
     # return jump
-    return_jump = relative_jump(patch_rva + return_offset, RETURN_RVA)
+    hook_return_rva = offset_to_rva(hook_return_offset, section_headers)
+    return_jump = relative_jump(patch_rva + payload_return_offset, hook_return_rva)
 
-
-    return (hook_offset, return_offset, hook_jump, return_jump)
+    return (hook_jump, return_jump)
 
 def insert_trampoline(data, payload, hook_offset, return_offset, hook_jump, return_jump):
 
@@ -276,14 +291,11 @@ def update_headers(data, payload, coff_offset, optional_offset, section_count, s
     checksum = get_checksum(data, optional_offset)
     write_u32(data, optional_offset + 64, checksum)
 
-def save_to_file(data, path):
-    Path(path).write_bytes(data)
-
-EXPECTED_HASH = "f9206d85c82f4d02fd0ac391781d19c5c68394a9ffc48accca0e1f5966db8699"
-HOOK_RVA = 0x4A6119
-RETURN_RVA = 0x4A617F
-EXPECTED_HOOK_SIGNIATURE = bytes.fromhex("F3 0F 10 61 14")
-RETURN_PLACEHOLDER_SIGNIATURE = bytes.fromhex("E9 78 56 34 12")
+EXPECTED_EXE_HASH = "f9206d85c82f4d02fd0ac391781d19c5c68394a9ffc48accca0e1f5966db8699"
+EXPECTED_PAYLOAD_HASH = "0abdcea5c39702fbdff1b84bc2c21d7c71bcf49b68c0086513fb89ef5d330507"
+HOOK_ENTRY_SIGNIATURE = bytes.fromhex("F3 0F 10 61 14   F3 0F 10 51 10   F3 0F 10 59 18   0F 28 EC   F3 0F 59 6D 18")
+HOOK_RETURN_SIGNIATURE = bytes.fromhex("F3 0F 11 63 10   F3 0F 11 73 14   F3 0F 11 6B 18")
+PAYLOAD_RETURN_SIGNIATURE = bytes.fromhex("E9 78 56 34 12")
 PATCH_PAYLOAD_PATH = (Path(__file__).resolve().parent / "fixed_normal_calculation.bin")
 
 
@@ -293,7 +305,7 @@ root = Tk()
 root.withdraw()
 
 try:
-    # get executable path
+    # prompt for executable path
     exe_path = filedialog.askopenfilename(
         title = "Select Stormworks Executable (prefer 64 bit)", 
         filetypes = [
@@ -305,12 +317,15 @@ try:
     if not exe_path:
         raise SystemExit
 
+    backup_path = Path(exe_path + ".bak")
+    exe_path = Path(exe_path)
+
 
     # minor safeguard
-    if not "stormworks" in exe_path:
+    if not "stormworks" in exe_path.name:
         messagebox.showerror(
             "Invalid file", 
-            "Please select a stormworks executable"
+            "Please select a valid stormworks executable"
         )
         raise SystemExit
 
@@ -326,34 +341,81 @@ try:
 
 
     # load patch payload
-    payload, return_offset = load_payload(PATCH_PAYLOAD_PATH)
+    payload = load_payload(PATCH_PAYLOAD_PATH)
 
-    # load and backup executable
+    # load executable
     data = load_exe(exe_path)
 
-    backup_path = Path(exe_path + ".bak")
+    # get headers and details
+    coff_offset, optional_offset, section_offset, section_count = get_headers(data)
+    section_allignment, file_allignment = get_allignments(data, optional_offset)
+    section_headers = get_section_headers(data, section_offset, section_count)
 
-    if backup_path.exists():
-
-        confirmed = messagebox.askokcancel(
-            "Backup Already Exists",
-            "A backup already exists at the selected location!\nIf you are simply patching again due to a game update, this will not interfere with any operations\nOverwrite and continue anyways?"
+    # check for existing patch region
+    if any(header["name"] == ".patch" for header in section_headers):
+        messagebox.showwarning(
+            "Warning!",
+            "The patch has already been applied to this executable!"
         )
-
-        if not confirmed:
-            raise SystemExit
-
-    save_to_file(data, backup_path)
+        raise SystemExit
 
     # get patch details
-    coff_offset, optional_offset, section_offset, section_count = get_headers(data)
-    section_headers = get_section_headers(data, section_offset, section_count)
-    section_allignment, file_allignment = get_allignments(data, optional_offset)
     patch_header_offset, patch_rva, patch_raw_offset = get_patch_section_details(data, optional_offset, section_offset, section_count, section_headers)
 
+    # scan for exe signiatures
+    matches = scan_for_signiature(data, HOOK_ENTRY_SIGNIATURE)
+    
+    if len(matches) != 1:
+        messagebox.showerror(
+            "Error!",
+            f"An unexpected number ({len(matches)}) of hook entry signiatures were found!\nThis likely indicates this patcher is out of date\nPlease check for any updates!"
+        )
+        raise SystemExit
+    
+    hook_entry_offset = matches[0]
+    matches = scan_for_signiature(data, HOOK_RETURN_SIGNIATURE, hook_entry_offset, 0x200) # expecting a 0x66 delta
+
+    if len(matches) != 1:
+        messagebox.showerror(
+            "Error!",
+            f"An unexpected number ({len(matches)}) of hook return signiatures were found!\nThis likely indicates this patcher is out of date\nPlease check for any updates!"
+        )
+        raise SystemExit
+
+    hook_return_offset = matches[0]
+
+    # scan for payload signiature
+    matches = scan_for_signiature(payload, PAYLOAD_RETURN_SIGNIATURE)
+
+    if len(matches) != 1:
+        messagebox.showerror(
+            "Error!",
+            f"An unexpected number ({len(matches)}) of patch return signiatures were found!\nThis likely indicates this patcher is out of date\nPlease check for any updates!"
+        )
+        raise SystemExit
+
+    payload_return_offset = matches[0]
+
+    # backup executable
+    if backup_path.exists():
+    
+        response = messagebox.askyesnocancel(
+            "Backup Already Exists",
+            "A backup already exists at the attempted location!\nOverwrite it?"
+        )
+    
+        if response is True:
+            save_to_file(data, backup_path)
+    
+        if response is None:
+            raise SystemExit
+    
+    else:
+        save_to_file(data, backup_path)
+
     # insert trampoline
-    hook_offset, return_offset, hook_jump, return_jump = get_trampoline_details(data, payload, section_headers, patch_rva, return_offset)
-    insert_trampoline(data, payload, hook_offset, return_offset, hook_jump, return_jump)
+    hook_jump, return_jump = get_trampoline_instructions(section_headers, hook_entry_offset, hook_return_offset, payload_return_offset, patch_rva)
+    insert_trampoline(data, payload, hook_entry_offset, payload_return_offset, hook_jump, return_jump)
 
     # insert patch
     insert_patch_section_header(data, patch_header_offset, patch_rva, patch_raw_offset, len(payload), file_allignment)
@@ -369,12 +431,12 @@ try:
     # patch complete
     messagebox.showinfo(
         "Patch Successful!",
-        f"Patched executable at:\n{exe_path}\n\nBackup available at:\n{exe_path + ".bak"}",
+        f"Patched executable at:\n{exe_path}\n\nBackup available at:\n{backup_path}",
     )
 
 except (ValueError, OSError, struct.error) as error:
     messagebox.showerror(
-        "Patching failed",
+        "Patching failed!",
         str(error)
     )
 
