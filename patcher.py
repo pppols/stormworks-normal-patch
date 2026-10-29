@@ -65,16 +65,16 @@ def get_checksum(data, optional_offset):
 def save_to_file(data, path):
     path.write_bytes(data)
 
-def scan_for_signiature(data, signiature, search_start=0, search_length=None):
+def scan_for_signature(data, signature, search_start=0, search_length=None):
 
     offset = search_start
     search_end = (len(data)  if search_length is None  else search_start + search_length)
-    match_length = len(signiature)
+    match_length = len(signature)
     matches = []
     
     while True:
         
-        index = data.find(signiature, offset, search_end)
+        index = data.find(signature, offset, search_end)
 
         if index == -1:
             break
@@ -129,15 +129,15 @@ def load_exe(exe_path):
 
 def get_headers(data):
 
-    # verify signiatures
+    # verify signatures
     if data[0:2] != b"MZ":
-        raise ValueError("invalid dos signiature")
+        raise ValueError("invalid dos signature")
 
 
     pe_offset = read_u32(data, 0x3C)
 
     if data[pe_offset:pe_offset + 4] != b"PE\x00\x00":
-        raise ValueError("invalid pe signiature")
+        raise ValueError("invalid pe signature")
 
 
     coff_offset = pe_offset + 4
@@ -186,6 +186,72 @@ def get_allignments(data, optional_offset):
     file_allignment = read_u32(data, optional_offset + 36)
 
     return (section_allignment, file_allignment)
+
+def scan_for_hook_signatures(data, payload):
+
+    hook_addresses = []
+
+    for hook in HOOKS:
+
+        hook_entry_signature = hook["hook_entry"]
+        hook_return_signature = hook["hook_return"]
+        payload_entry_signature = hook["payload_entry"]
+        payload_return_signature = hook["payload_return"]
+
+
+        # hook entry
+        matches = scan_for_signature(data, hook_entry_signature)
+
+        if len(matches) != 1:
+            break
+
+        hook_entry_offset = matches[0]
+
+        # hook return
+        matches = scan_for_signature(data, hook_return_signature, hook_entry_offset, 0x200) # expected maximum delta of 0x1A8
+
+        if len(matches) != 1:
+            break
+
+        hook_return_offset = matches[0]
+
+
+        # payload entry
+        matches = scan_for_signature(payload, payload_entry_signature)
+
+        if len(matches) != 1:
+            break
+
+        payload_entry_offset = matches[0] + len(payload_entry_signature) # instructions begin after the marker 
+
+        # payload return
+        matches = scan_for_signature(payload, payload_return_signature, payload_entry_offset, 0x200)
+
+        if len(matches) != 1:
+            break
+
+        payload_return_offset = matches[0]
+
+
+        # insert addresses
+        hook_addresses.append({
+            "hook_entry": hook_entry_offset,
+            "hook_return": hook_return_offset,
+            "payload_entry": payload_entry_offset,
+            "payload_return": payload_return_offset
+        })
+
+
+    # handle early exit
+    if len(hook_addresses) != len(HOOKS):
+        messagebox.showerror(
+            "Error!",
+            "An unexpected number of hooks signatures were found!\nThis likely indicates this patcher is out of date\nPlease check for any updates!"
+        )
+        raise SystemExit
+
+
+    return hook_addresses
 
 def get_patch_section_details(data, optional_offset, section_offset, section_count, section_headers):
 
@@ -256,22 +322,51 @@ def insert_patch_section(data, payload, raw_offset, file_allignment):
 
     data.extend(b"\x00" * (raw_size - len(payload)))
 
-def get_trampoline_instructions(section_headers, hook_entry_offset, hook_return_offset, payload_return_offset, patch_rva):
+def get_hook_instructions(section_headers, patch_rva, hook_addresses):
 
-    # entry jump
-    hook_entry_rva = offset_to_rva(hook_entry_offset, section_headers)
-    hook_jump = relative_jump(hook_entry_rva, patch_rva)
+    hook_instructions = []
 
-    # return jump
-    hook_return_rva = offset_to_rva(hook_return_offset, section_headers)
-    return_jump = relative_jump(patch_rva + payload_return_offset, hook_return_rva)
+    for hook in hook_addresses:
 
-    return (hook_jump, return_jump)
+        hook_entry_offset = hook["hook_entry"]
+        hook_return_offset = hook["hook_return"]
+        payload_entry_offset = hook["payload_entry"]
+        payload_return_offset = hook["payload_return"]
 
-def insert_trampoline(data, payload, hook_offset, return_offset, hook_jump, return_jump):
+        # entry jump
+        hook_entry_rva = offset_to_rva(hook_entry_offset, section_headers)
+        payload_entry_rva = patch_rva + payload_entry_offset
+        entry_jump = relative_jump(hook_entry_rva, payload_entry_rva)
 
-    data[hook_offset:hook_offset + 5] = hook_jump
-    payload[return_offset:return_offset + 5] = return_jump
+        # return jump
+        hook_return_rva = offset_to_rva(hook_return_offset, section_headers)
+        payload_return_rva = patch_rva + payload_return_offset
+        return_jump = relative_jump(payload_return_rva, hook_return_rva)
+
+        # insert instructions
+        hook_instructions.append({
+            "entry_jump": entry_jump,
+            "return_jump": return_jump
+        })
+    
+    return hook_instructions
+
+def insert_hooks(data, payload, hook_addresses, hook_instructions):
+
+    hook_count = len(HOOKS)
+
+    for i in range(hook_count):
+
+        hook_address = hook_addresses[i]
+        hook_instruction = hook_instructions[i]
+
+        entry_address = hook_address["hook_entry"]
+        return_address = hook_address["payload_return"]
+        entry_jump = hook_instruction["entry_jump"]
+        return_jump = hook_instruction["return_jump"]
+
+        data[entry_address:entry_address + 5] = entry_jump
+        payload[return_address:return_address + 5] = return_jump
 
 def update_headers(data, payload, coff_offset, optional_offset, section_count, section_allignment, file_allignment, patch_rva):
 
@@ -291,12 +386,48 @@ def update_headers(data, payload, coff_offset, optional_offset, section_count, s
     checksum = get_checksum(data, optional_offset)
     write_u32(data, optional_offset + 64, checksum)
 
-EXPECTED_EXE_HASH = "f9206d85c82f4d02fd0ac391781d19c5c68394a9ffc48accca0e1f5966db8699"
-EXPECTED_PAYLOAD_HASH = "0abdcea5c39702fbdff1b84bc2c21d7c71bcf49b68c0086513fb89ef5d330507"
-HOOK_ENTRY_SIGNIATURE = bytes.fromhex("F3 0F 10 61 14   F3 0F 10 51 10   F3 0F 10 59 18   0F 28 EC   F3 0F 59 6D 18")
-HOOK_RETURN_SIGNIATURE = bytes.fromhex("F3 0F 11 63 10   F3 0F 11 73 14   F3 0F 11 6B 18")
-PAYLOAD_RETURN_SIGNIATURE = bytes.fromhex("E9 78 56 34 12")
+EXPECTED_EXE_HASH = "c38c03ff756b4f42bbc9f11cdbb034977ad0f968e45741c5cf410732f22a338d"
+EXPECTED_PAYLOAD_HASH = "a03db562458437a448bd2c6794bdade10c3a35d38a29e99c9ae59b6455303239"
 PATCH_PAYLOAD_PATH = (Path(__file__).resolve().parent / "fixed_normal_calculation.bin")
+
+HOOKS = [
+    { # a1
+        "hook_entry": bytes.fromhex("F3 0F 10 49 14   F3 0F 10 41 10   F3 0F 10 51 18   F3 44 0F 59 E8   F3 44 0F 59 E1"),
+        "hook_return": bytes.fromhex("F3 44 0F 11 7E 10   F3 44 0F 11 76 14   F3 44 0F 11 6E 18   48 8B 44 24 28   8B 40 38"),
+        "payload_entry": bytes.fromhex("E8 11 11 11"),
+        "payload_return": bytes.fromhex("E9 11 11 11 11"),
+    },
+    { # a2
+        "hook_entry": bytes.fromhex("F3 0F 10 59 14   F3 0F 10 51 10   F3 0F 10 61 18   F3 44 0F 10 6D 08   F3 44 0F 59 EA"),
+        "hook_return": bytes.fromhex("F3 44 0F 11 7E 10   F3 44 0F 11 76 14   F3 44 0F 11 6E 18   48 8B 44 24 28   8B 40 38"),
+        "payload_entry": bytes.fromhex("E8 22 22 22"),
+        "payload_return": bytes.fromhex("E9 22 22 22 22"),
+    },
+    { # b1
+        "hook_entry": bytes.fromhex("F3 0F 10 61 14   F3 0F 10 51 10   F3 0F 10 59 18   0F 28 EC   F3 0F 59 6D 58"),
+        "hook_return": bytes.fromhex("F3 0F 11 63 10   F3 0F 11 73 14   F3 0F 11 6B 18   48 8B 44 24 28   8B 40 38"),
+        "payload_entry": bytes.fromhex("E8 33 33 33"),
+        "payload_return": bytes.fromhex("E9 33 33 33 33"),
+    },
+    { # b2
+        "hook_entry": bytes.fromhex("F3 0F 10 61 14   F3 0F 10 51 10   F3 0F 10 59 18   0F 28 EC   F3 0F 59 6D 18"),
+        "hook_return": bytes.fromhex("F3 0F 11 63 10   F3 0F 11 73 14   F3 0F 11 6B 18   48 8B 44 24 28   8B 40 38"),
+        "payload_entry": bytes.fromhex("E8 44 44 44"),
+        "payload_return": bytes.fromhex("E9 44 44 44 44"),
+    },
+    { # face
+        "hook_entry": bytes.fromhex("F3 44 0F 10 45 08   F3 44 0F 59 C2   F3 0F 10 45 18   F3 0F 59 C3   F3 44 0F 58 C0"),
+        "hook_return": bytes.fromhex("8B 4F 10   44 8B 47 08   41 8D 72 21   41 3B C8   75 1C"),
+        "payload_entry": bytes.fromhex("E8 55 55 55"),
+        "payload_return": bytes.fromhex("E9 55 55 55 55"),
+    },
+    { # virtual
+        "hook_entry": bytes.fromhex("F3 42 0F 10 74 09 14   F3 42 0F 10 5C 09 10   0F 28 EE   F3 42 0F 10 64 09 18   0F 28 D6"),
+        "hook_return": bytes.fromhex("0F B7 04 7A   48 6B C8 1C   46 0F B6 44 09 0C   41 8D 80 01 FF FF FF   99"),
+        "payload_entry": bytes.fromhex("E8 66 66 66"),
+        "payload_return": bytes.fromhex("E9 66 66 66 66"),
+    }
+]
 
 
 
@@ -362,39 +493,8 @@ try:
     # get patch details
     patch_header_offset, patch_rva, patch_raw_offset = get_patch_section_details(data, optional_offset, section_offset, section_count, section_headers)
 
-    # scan for exe signiatures
-    matches = scan_for_signiature(data, HOOK_ENTRY_SIGNIATURE)
-    
-    if len(matches) != 1:
-        messagebox.showerror(
-            "Error!",
-            f"An unexpected number ({len(matches)}) of hook entry signiatures were found!\nThis likely indicates this patcher is out of date\nPlease check for any updates!"
-        )
-        raise SystemExit
-    
-    hook_entry_offset = matches[0]
-    matches = scan_for_signiature(data, HOOK_RETURN_SIGNIATURE, hook_entry_offset, 0x200) # expecting a 0x66 delta
-
-    if len(matches) != 1:
-        messagebox.showerror(
-            "Error!",
-            f"An unexpected number ({len(matches)}) of hook return signiatures were found!\nThis likely indicates this patcher is out of date\nPlease check for any updates!"
-        )
-        raise SystemExit
-
-    hook_return_offset = matches[0]
-
-    # scan for payload signiature
-    matches = scan_for_signiature(payload, PAYLOAD_RETURN_SIGNIATURE)
-
-    if len(matches) != 1:
-        messagebox.showerror(
-            "Error!",
-            f"An unexpected number ({len(matches)}) of patch return signiatures were found!\nThis likely indicates this patcher is out of date\nPlease check for any updates!"
-        )
-        raise SystemExit
-
-    payload_return_offset = matches[0]
+    # scan for hook signatures
+    hook_addresses = scan_for_hook_signatures(data, payload)
 
     # backup executable
     if backup_path.exists():
@@ -413,9 +513,9 @@ try:
     else:
         save_to_file(data, backup_path)
 
-    # insert trampoline
-    hook_jump, return_jump = get_trampoline_instructions(section_headers, hook_entry_offset, hook_return_offset, payload_return_offset, patch_rva)
-    insert_trampoline(data, payload, hook_entry_offset, payload_return_offset, hook_jump, return_jump)
+    # insert hooks
+    hook_instructions = get_hook_instructions(section_headers, patch_rva, hook_addresses)
+    insert_hooks(data, payload, hook_addresses, hook_instructions)
 
     # insert patch
     insert_patch_section_header(data, patch_header_offset, patch_rva, patch_raw_offset, len(payload), file_allignment)
