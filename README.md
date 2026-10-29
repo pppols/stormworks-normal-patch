@@ -31,7 +31,7 @@ a small client side exe patcher to solve the commonly named "xml shadow", via co
 ## note!
 being something that modifies the executable itself: any time the game updates and modifies the executable, you will have to apply the patch again  
 
-along with that, new game versions may affect the underlying mesh update systems that this serves to fix, if you are applying this tool on a newer game version, there is a chance it may fail!"
+along with that, new game versions may affect the underlying mesh update systems that this serves to fix, if you are applying this tool on a newer game version, there is a chance it may fail!
 
 in that case, either reinstate the exe backup it creates in the same folder as the stormworks executable, or verify your game files on steam to return to the original configuration  
 
